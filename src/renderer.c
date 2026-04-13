@@ -13,6 +13,15 @@ static const renderer_backend_vtable* select_vtable(renderer_backend backend) {
     }
 }
 
+char* renderer_backend_to_string(renderer_backend backend) {
+    switch (backend) {
+        case RENDERER_BACKEND_OPENGL: return "OpenGL"; break;
+        case RENDERER_BACKEND_VULKAN: return "Vulkan"; break;
+        case RENDERER_BACKEND_D3D11:  return "D3D11";  break;
+    }
+    return "NO BACKEND";
+}
+
 renderer_t* renderer_create(const renderer_create_desc* desc) {
     if (!desc || !desc->native_window_handle) return NULL;
     const renderer_backend_vtable* vtable = select_vtable(desc->backend);
@@ -144,6 +153,13 @@ void renderer_cmd_bind_texture(renderer_cmd_t* cmd, renderer_texture_t* t,
 void renderer_cmd_push_constants(renderer_cmd_t* cmd, renderer_pipeline_t* p,
                                   const void* data, uint32_t size) {
     if (cmd) cmd->vtable->cmd_push_constants(cmd, p, data, size);
+}
+
+void renderer_cmd_bind_uniform_buffer(renderer_cmd_t* cmd, renderer_buffer_t* b,
+                                      uint32_t slot, uint32_t byte_offset,
+                                      uint32_t byte_size) {
+    if (cmd && b)
+        cmd->vtable->cmd_bind_uniform_buffer(cmd, b, slot, byte_offset, byte_size);
 }
 
 void renderer_cmd_set_viewport(renderer_cmd_t* cmd, float x, float y,

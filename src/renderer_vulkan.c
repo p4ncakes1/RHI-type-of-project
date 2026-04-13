@@ -24,6 +24,80 @@
 #define VK_FRAMES_IN_FLIGHT 2u
 #define VK_MAX_RENDER_PASSES 64u
 #define VK_MAX_SWAPCHAIN_IMAGES 8u
+#define VK_MAX_BOUND_TEXTURES 4u
+#define VK_MAX_BOUND_UBOS      8u
+#define VK_DESC_SETS_PER_POOL  512u
+
+typedef struct {
+    VkDescriptorPool* pools;
+    uint32_t          count, capacity, active;
+} vk_desc_pool_chain;
+
+/* Forward-declared because vk_renderer_data is not complete yet */
+static VkDescriptorPool vk_create_desc_pool(VkDevice dev,
+                                            uint32_t sampler_count,
+                                            uint32_t ubo_count,
+                                            uint32_t max_sets);
+
+static int vk_desc_pool_chain_init(vk_desc_pool_chain* c, VkDevice dev) {
+    c->capacity = 4;
+    c->pools    = calloc(c->capacity, sizeof(VkDescriptorPool));
+    if (!c->pools) return -1;
+    c->pools[0] = vk_create_desc_pool(dev,
+        VK_DESC_SETS_PER_POOL * VK_MAX_BOUND_TEXTURES,
+        VK_DESC_SETS_PER_POOL * VK_MAX_BOUND_UBOS,
+        VK_DESC_SETS_PER_POOL);
+    if (!c->pools[0]) { free(c->pools); return -1; }
+    c->count = 1; c->active = 0;
+    return 0;
+}
+
+static void vk_desc_pool_chain_reset(vk_desc_pool_chain* c, VkDevice dev) {
+    for (uint32_t i = 0; i < c->count; ++i)
+        vkResetDescriptorPool(dev, c->pools[i], 0);
+    c->active = 0;
+}
+
+static void vk_desc_pool_chain_destroy(vk_desc_pool_chain* c, VkDevice dev) {
+    for (uint32_t i = 0; i < c->count; ++i)
+        vkDestroyDescriptorPool(dev, c->pools[i], NULL);
+    free(c->pools);
+    c->pools = NULL; c->count = 0; c->capacity = 0;
+}
+
+static VkDescriptorSet vk_desc_chain_alloc(vk_desc_pool_chain*   c,
+                                            VkDevice              dev,
+                                            VkDescriptorSetLayout layout) {
+    for (;;) {
+        VkDescriptorSetAllocateInfo ai = {
+            .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool     = c->pools[c->active],
+            .descriptorSetCount = 1,
+            .pSetLayouts        = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkResult r = vkAllocateDescriptorSets(dev, &ai, &set);
+        if (r == VK_SUCCESS) return set;
+
+        /* Pool exhausted — grow the chain. */
+        uint32_t next = c->active + 1;
+        if (next >= c->count) {
+            if (c->count >= c->capacity) {
+                uint32_t nc = c->capacity * 2;
+                VkDescriptorPool* p = realloc(c->pools, nc * sizeof(VkDescriptorPool));
+                if (!p) return VK_NULL_HANDLE;
+                c->pools = p; c->capacity = nc;
+            }
+            c->pools[c->count] = vk_create_desc_pool(dev,
+                VK_DESC_SETS_PER_POOL * VK_MAX_BOUND_TEXTURES,
+                VK_DESC_SETS_PER_POOL * VK_MAX_BOUND_UBOS,
+                VK_DESC_SETS_PER_POOL);
+            if (!c->pools[c->count]) return VK_NULL_HANDLE;
+            ++c->count;
+        }
+        c->active = next;
+    }
+}
 
 typedef struct
 {
@@ -70,6 +144,7 @@ typedef struct
 {
     VkCommandBuffer cmd;
     VkFence fence;
+    vk_desc_pool_chain desc_pools;
 } vk_frame_sync;
 
 typedef struct
@@ -110,6 +185,11 @@ typedef struct
     VkSemaphore              render_done[VK_MAX_SWAPCHAIN_IMAGES];
     VkSemaphore              pending_render_sem;
 
+    VkDescriptorSetLayout    desc_layout;
+    renderer_texture_t* dummy_tex;
+    VkBuffer         dummy_ubo_buf;
+    VkDeviceMemory   dummy_ubo_mem;
+
 #if defined(_DEBUG) || defined(RENDERER_VK_VALIDATION)
     VkDebugUtilsMessengerEXT debug_messenger;
 #endif
@@ -121,6 +201,12 @@ typedef struct
     vk_pipeline_data *bound_pipeline;
     VkFramebuffer active_framebuffer;
     VkRenderPass active_render_pass;
+    vk_texture_data* bound_textures[VK_MAX_BOUND_TEXTURES];
+    int textures_dirty;
+    vk_buffer_data*  bound_ubos[VK_MAX_BOUND_UBOS];
+    uint32_t         bound_ubo_offsets[VK_MAX_BOUND_UBOS];
+    uint32_t         bound_ubo_sizes[VK_MAX_BOUND_UBOS];
+    int              ubos_dirty;
 } vk_cmd_data;
 
 #define VK_RD(r) ((vk_renderer_data *)(r)->backend_data)
@@ -456,6 +542,9 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL vk_debug_callback(
 }
 #endif
 
+static renderer_texture_t *vulkan_texture_create(renderer_t *r, const renderer_texture_desc *desc);
+static void vulkan_texture_destroy(renderer_t *r, renderer_texture_t *t);
+
 static int create_instance(vk_renderer_data *rd)
 {
     const char *extensions[] = {
@@ -688,7 +777,6 @@ static VkPresentModeKHR choose_present_mode(vk_renderer_data *rd, int vsync)
 
 static VkFormat choose_depth_format(vk_renderer_data *rd)
 {
-    /* Prefer D24S8, fall back to D32F_S8, then D32F */
     static const VkFormat candidates[] = {
         VK_FORMAT_D24_UNORM_S8_UINT,
         VK_FORMAT_D32_SFLOAT_S8_UINT,
@@ -704,7 +792,6 @@ static VkFormat choose_depth_format(vk_renderer_data *rd)
     return VK_FORMAT_D32_SFLOAT;
 }
 
-/* Build / rebuild the VkRenderPass used for swapchain rendering. */
 static int build_swapchain_render_pass(vk_renderer_data *rd)
 {
     VkSampleCountFlagBits samples = (rd->sample_count > 1)
@@ -1073,6 +1160,8 @@ static int create_frame_objects(vk_renderer_data *rd)
         rd->frames[i].cmd = cbs[i];
         if (vkCreateFence(rd->device, &fi, NULL, &rd->frames[i].fence) != VK_SUCCESS)
             return -1;
+        if (vk_desc_pool_chain_init(&rd->frames[i].desc_pools, rd->device) != 0)
+            return -1;
     }
     for (uint32_t i = 0; i < rd->swapchain_image_count && i < VK_MAX_SWAPCHAIN_IMAGES; ++i)
         if (vkCreateSemaphore(rd->device, &si, NULL, &rd->image_avail[i]) != VK_SUCCESS)
@@ -1112,6 +1201,66 @@ static int vulkan_init(renderer_t *r, const renderer_create_desc *desc)
         goto fail;
     if (create_frame_objects(rd) != 0)
         goto fail;
+
+    /* ---- Descriptor set layout: textures (set=0, b0..3) + UBOs (b4..11) ---- */
+    VkDescriptorSetLayoutBinding bindings[VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS];
+    memset(bindings, 0, sizeof(bindings));
+    for (int i = 0; i < VK_MAX_BOUND_TEXTURES; i++) {
+        bindings[i].binding         = (uint32_t)i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    for (int i = 0; i < VK_MAX_BOUND_UBOS; i++) {
+        int b = VK_MAX_BOUND_TEXTURES + i;
+        bindings[b].binding         = (uint32_t)b;
+        bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[b].descriptorCount = 1;
+        bindings[b].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT |
+                                       VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS,
+        .pBindings    = bindings,
+    };
+    if (vkCreateDescriptorSetLayout(rd->device, &layout_info, NULL,
+                                     &rd->desc_layout) != VK_SUCCESS)
+        goto fail;
+
+    /* Dummy 1x1 White Texture for unbound slots */
+    uint32_t dummy_pixel = 0xFFFFFFFF;
+    renderer_texture_desc dummy_desc = {
+        .width = 1, .height = 1, .format = RENDERER_TEXTURE_FORMAT_RGBA8,
+        .pixels = &dummy_pixel,
+        .usage = RENDERER_TEXTURE_USAGE_SAMPLED,
+        .min_filter = RENDERER_FILTER_NEAREST,
+        .mag_filter = RENDERER_FILTER_NEAREST,
+    };
+    rd->dummy_tex = vulkan_texture_create(r, &dummy_desc);
+    if (!rd->dummy_tex)
+        goto fail;
+
+    /* ---- 256-byte dummy UBO for unbound UBO slots ---- */
+    {
+        VkBufferCreateInfo bci = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size  = 256,
+            .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        };
+        if (vkCreateBuffer(rd->device, &bci, NULL, &rd->dummy_ubo_buf) != VK_SUCCESS)
+            goto fail;
+        if (alloc_buffer_memory(rd->device, &rd->mem_props, rd->dummy_ubo_buf,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                &rd->dummy_ubo_mem) < 0)
+            goto fail;
+        void* p;
+        vkMapMemory(rd->device, rd->dummy_ubo_mem, 0, 256, 0, &p);
+        memset(p, 0, 256);
+        vkUnmapMemory(rd->device, rd->dummy_ubo_mem);
+    }
+
     return 0;
 
 fail:
@@ -1125,10 +1274,19 @@ static void vulkan_shutdown(renderer_t *r)
         return;
     if (rd->device)
         vkDeviceWaitIdle(rd->device);
+
+    if (rd->dummy_tex)
+        vulkan_texture_destroy(r, rd->dummy_tex);
+    if (rd->dummy_ubo_buf) vkDestroyBuffer(rd->device, rd->dummy_ubo_buf, NULL);
+    if (rd->dummy_ubo_mem) vkFreeMemory(rd->device, rd->dummy_ubo_mem, NULL);
+    if (rd->desc_layout)
+        vkDestroyDescriptorSetLayout(rd->device, rd->desc_layout, NULL);
+
     for (uint32_t i = 0; i < VK_FRAMES_IN_FLIGHT; ++i)
     {
         if (rd->frames[i].fence)
             vkDestroyFence(rd->device, rd->frames[i].fence, NULL);
+        vk_desc_pool_chain_destroy(&rd->frames[i].desc_pools, rd->device);
     }
     for (uint32_t i = 0; i < rd->swapchain_image_count && i < VK_MAX_SWAPCHAIN_IMAGES; ++i)
         if (rd->image_avail[i])
@@ -1198,13 +1356,11 @@ static void vulkan_begin_frame(renderer_t *r)
 
     vkWaitForFences(rd->device, 1, &f->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(rd->device, 1, &f->fence);
+    vk_desc_pool_chain_reset(&f->desc_pools, rd->device);
 
     VkResult res = vkAcquireNextImageKHR(rd->device, rd->swapchain, UINT64_MAX,
                                          rd->pending_acquire_sem, VK_NULL_HANDLE,
                                          &rd->swapchain_index);
-    /* Swap: the semaphore we just signalled becomes the per-image slot's new
-       "ready" semaphore; the old per-image semaphore (presentation finished with
-       it) becomes the next pending semaphore to hand to the next acquire. */
     VkSemaphore just_acquired          = rd->pending_acquire_sem;
     rd->pending_acquire_sem            = rd->image_avail[rd->swapchain_index];
     rd->image_avail[rd->swapchain_index] = just_acquired;
@@ -1231,9 +1387,6 @@ static void vulkan_present(renderer_t *r)
         .pImageIndices = &rd->swapchain_index,
     };
     VkResult res = vkQueuePresentKHR(rd->graphics_queue, &pi);
-    /* Swap: pending_render_sem was just handed to the presentation engine.
-       Recycle the per-image slot (presentation engine finished with it when
-       this image was last presented) as the new free semaphore. */
     VkSemaphore just_presented                 = rd->pending_render_sem;
     rd->pending_render_sem                     = rd->render_done[rd->swapchain_index];
     rd->render_done[rd->swapchain_index]       = just_presented;
@@ -1414,32 +1567,6 @@ static renderer_pipeline_t *vulkan_pipeline_create(
     if (!desc->vert_src || !desc->frag_src || !desc->render_pass)
         return NULL;
 
-    /* In a production Vulkan backend, vert_src/frag_src would be pre-compiled
-     * SPIR-V blobs passed as (const uint32_t*, size_t) pairs.  For convenience
-     * and compatibility with the existing main.c that passes GLSL strings we
-     * expect the caller to pass SPIR-V bytecode cast to const char*, with the
-     * size encoded as a uint32_t in desc->push_constant_size when the msb is
-     * set — OR the user links shaderc/glslang and compiles at runtime.
-     *
-     * To keep this backend self-contained without a runtime compiler dependency,
-     * we detect SPIR-V by the magic number 0x07230203 in the first 4 bytes and
-     * interpret the pointer as (const uint32_t*) with the byte-length stored in
-     * the secondary fields below.  GLSL strings are not accepted here; callers
-     * must pre-compile their shaders with glslangValidator or shaderc.
-     *
-     * Convenience macros for the caller:
-     *   RENDERER_VK_SPIRV(ptr, byte_len)  — used in renderer_pipeline_desc
-     *     .vert_src = (const char*)(spirv_vert_data)
-     *     .frag_src = (const char*)(spirv_frag_data)
-     * The byte lengths are passed via the new fields:
-     *   .vert_spirv_size  (uint32_t)
-     *   .frag_spirv_size  (uint32_t)
-     * These fields do not exist in the current renderer_pipeline_desc; see
-     * the note at the bottom of renderer.h about adding them for Vulkan.
-     *
-     * For now, we use the common convention that SPIR-V data is terminated by a
-     * sentinel 0x00000000 word so we can compute the length ourselves.
-     */
     const uint32_t *vert_spirv = (const uint32_t *)desc->vert_src;
     const uint32_t *frag_spirv = (const uint32_t *)desc->frag_src;
 
@@ -1458,17 +1585,6 @@ static renderer_pipeline_t *vulkan_pipeline_create(
         return NULL;
     }
 
-    /* Compute SPIR-V sizes by finding the word count from the SPIR-V header.
-     * Word[2] in the SPIR-V header is the bound (IDs), which is not the size.
-     * The actual size is encoded in the bound field of the binary header.
-     * We use the SPIR-V header word[0]=magic, word[1]=version, word[2]=generator,
-     * word[3]=bound, word[4]=schema(0).  The total word count is not in the
-     * header itself, so we require zero-word termination OR we read the file
-     * size passed by the caller.
-     *
-     * For simplicity: we scan for a sentinel 0x00000000 end-marker appended
-     * by the build system.  If none is found within 256 KiB we give up.
-     */
     size_t vert_words = (desc->vert_spirv_size > 0)
                             ? desc->vert_spirv_size / 4
                             : ({ size_t n = 5; while (n < 256*1024/4 && vert_spirv[n]) ++n; n; });
@@ -1507,6 +1623,8 @@ static renderer_pipeline_t *vulkan_pipeline_create(
     };
     VkPipelineLayoutCreateInfo lci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &rd->desc_layout,
         .pushConstantRangeCount = desc->push_constant_size ? 1 : 0,
         .pPushConstantRanges = desc->push_constant_size ? &pc_range : NULL,
     };
@@ -2047,6 +2165,7 @@ fail:
 static void vulkan_texture_destroy(renderer_t *r, renderer_texture_t *t)
 {
     vk_renderer_data *rd = VK_RD(r);
+    vkDeviceWaitIdle(rd->device);
     vk_texture_data *data = VK_TEX(t);
     if (data->sampler)
         vkDestroySampler(rd->device, data->sampler, NULL);
@@ -2192,6 +2311,8 @@ static void vulkan_cmd_bind_pipeline(renderer_cmd_t *cmd, renderer_pipeline_t *p
     vk_pipeline_data *data = VK_PL(pl);
     cd->bound_pipeline = data;
     vkCmdBindPipeline(cd->vk_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, data->pipeline);
+    cd->textures_dirty = 1;
+    cd->ubos_dirty     = 1;
 }
 
 static void vulkan_cmd_bind_vertex_buffer(renderer_cmd_t *cmd, renderer_buffer_t *buf,
@@ -2214,18 +2335,26 @@ static void vulkan_cmd_bind_index_buffer(renderer_cmd_t *cmd, renderer_buffer_t 
 static void vulkan_cmd_bind_texture(renderer_cmd_t *cmd, renderer_texture_t *tex,
                                     uint32_t slot)
 {
-    /* Textures in Vulkan are bound via descriptor sets, not inline commands.
-     * A production backend would maintain a descriptor pool + set per pipeline.
-     * This stub stores the binding intent; the actual VkDescriptorSet update
-     * would happen in cmd_draw after all bindings are collected.
-     *
-     * For the scope of this abstraction layer (no descriptor set API in
-     * renderer.h), we leave this as a TODO stub that compiles cleanly.
-     */
-    (void)cmd;
-    (void)tex;
-    (void)slot;
-    /* TODO: update descriptor set at slot with tex->view + tex->sampler */
+    vk_cmd_data *cd = VK_CMD(cmd);
+    if (slot < VK_MAX_BOUND_TEXTURES) {
+        cd->bound_textures[slot] = tex ? VK_TEX(tex) : NULL;
+        cd->textures_dirty = 1;
+    }
+}
+
+static void vulkan_cmd_bind_uniform_buffer(renderer_cmd_t* cmd,
+                                            renderer_buffer_t* buf,
+                                            uint32_t slot,
+                                            uint32_t byte_offset,
+                                            uint32_t byte_size) {
+    vk_cmd_data* cd = VK_CMD(cmd);
+    if (slot >= VK_MAX_BOUND_UBOS) return;
+    cd->bound_ubos[slot]        = buf ? VK_BUF(buf) : NULL;
+    cd->bound_ubo_offsets[slot] = byte_offset;
+    cd->bound_ubo_sizes[slot]   = byte_size ? byte_size
+                                            : (buf ? VK_BUF(buf)->size : 256u);
+    cd->ubos_dirty     = 1;
+    cd->textures_dirty = 1;  /* force a combined set re-issue */
 }
 
 static void vulkan_cmd_push_constants(renderer_cmd_t *cmd, renderer_pipeline_t *pl,
@@ -2258,11 +2387,92 @@ static void vulkan_cmd_set_scissor(renderer_cmd_t *cmd, int x, int y, int w, int
     vkCmdSetScissor(cd->vk_cmd, 0, 1, &rect);
 }
 
+static VkDescriptorPool vk_create_desc_pool(VkDevice dev,
+                                             uint32_t sampler_count,
+                                             uint32_t ubo_count,
+                                             uint32_t max_sets) {
+    VkDescriptorPoolSize sizes[2] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampler_count },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         ubo_count     },
+    };
+    VkDescriptorPoolCreateInfo pi = {
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets       = max_sets,
+        .poolSizeCount = 2,
+        .pPoolSizes    = sizes,
+    };
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    vkCreateDescriptorPool(dev, &pi, NULL, &pool);
+    return pool;
+}
+
+static void vulkan_flush_descriptors(vk_cmd_data* cd) {
+    if (!cd->textures_dirty && !cd->ubos_dirty) return;
+    if (!cd->bound_pipeline) return;
+
+    vk_renderer_data*  rd  = cd->rd;
+    vk_desc_pool_chain* ch = &rd->frames[rd->current_frame].desc_pools;
+
+    VkDescriptorSet set = vk_desc_chain_alloc(ch, rd->device, rd->desc_layout);
+    if (set == VK_NULL_HANDLE) return;
+
+    VkDescriptorImageInfo  img[VK_MAX_BOUND_TEXTURES];
+    VkDescriptorBufferInfo buf[VK_MAX_BOUND_UBOS];
+    VkWriteDescriptorSet   writes[VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS];
+    uint32_t               wc = 0;
+
+    /* Texture bindings — binding 0..VK_MAX_BOUND_TEXTURES-1 */
+    for (int i = 0; i < VK_MAX_BOUND_TEXTURES; i++) {
+        vk_texture_data* td = cd->bound_textures[i]
+                            ? cd->bound_textures[i]
+                            : VK_TEX(rd->dummy_tex);
+        img[i] = (VkDescriptorImageInfo){
+            .sampler     = td->sampler,
+            .imageView   = td->view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        writes[wc++] = (VkWriteDescriptorSet){
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = set,
+            .dstBinding      = (uint32_t)i,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .pImageInfo      = &img[i],
+        };
+    }
+
+    /* UBO bindings — binding VK_MAX_BOUND_TEXTURES..+VK_MAX_BOUND_UBOS-1 */
+    for (int i = 0; i < VK_MAX_BOUND_UBOS; i++) {
+        vk_buffer_data* bd = cd->bound_ubos[i];
+        buf[i] = (VkDescriptorBufferInfo){
+            .buffer = bd ? bd->buffer : rd->dummy_ubo_buf,
+            .offset = bd ? cd->bound_ubo_offsets[i] : 0,
+            .range  = bd ? cd->bound_ubo_sizes[i]   : 256,
+        };
+        writes[wc++] = (VkWriteDescriptorSet){
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = set,
+            .dstBinding      = (uint32_t)(VK_MAX_BOUND_TEXTURES + i),
+            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .pBufferInfo     = &buf[i],
+        };
+    }
+
+    vkUpdateDescriptorSets(rd->device, wc, writes, 0, NULL);
+    vkCmdBindDescriptorSets(cd->vk_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            cd->bound_pipeline->layout, 0, 1, &set, 0, NULL);
+    cd->textures_dirty = 0;
+    cd->ubos_dirty     = 0;
+}
+
 static void vulkan_cmd_draw(renderer_cmd_t *cmd,
                             uint32_t vertex_count, uint32_t instance_count,
                             uint32_t first_vertex, uint32_t first_instance)
 {
-    vkCmdDraw(VK_CMD(cmd)->vk_cmd, vertex_count, instance_count,
+    vk_cmd_data *cd = VK_CMD(cmd);
+    vulkan_flush_descriptors(cd);
+    vkCmdDraw(cd->vk_cmd, vertex_count, instance_count,
               first_vertex, first_instance);
 }
 
@@ -2271,7 +2481,9 @@ static void vulkan_cmd_draw_indexed(renderer_cmd_t *cmd,
                                     uint32_t first_index, int32_t vertex_offset,
                                     uint32_t first_instance)
 {
-    vkCmdDrawIndexed(VK_CMD(cmd)->vk_cmd, index_count, instance_count,
+    vk_cmd_data *cd = VK_CMD(cmd);
+    vulkan_flush_descriptors(cd);
+    vkCmdDrawIndexed(cd->vk_cmd, index_count, instance_count,
                      first_index, vertex_offset, first_instance);
 }
 
@@ -2301,6 +2513,7 @@ static const renderer_backend_vtable s_vulkan_vtable = {
     .cmd_bind_index_buffer = vulkan_cmd_bind_index_buffer,
     .cmd_bind_texture = vulkan_cmd_bind_texture,
     .cmd_push_constants = vulkan_cmd_push_constants,
+    .cmd_bind_uniform_buffer = vulkan_cmd_bind_uniform_buffer,
     .cmd_set_viewport = vulkan_cmd_set_viewport,
     .cmd_set_scissor = vulkan_cmd_set_scissor,
     .cmd_draw = vulkan_cmd_draw,

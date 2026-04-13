@@ -67,6 +67,7 @@ typedef struct {
     ID3D11ShaderResourceView* srv;
     ID3D11RenderTargetView*   rtv;
     ID3D11DepthStencilView*   dsv;
+    ID3D11SamplerState* sampler;
 } d3d11_texture_data;
 
 typedef struct {
@@ -626,6 +627,16 @@ static void d3d11_buffer_update(renderer_t* r, renderer_buffer_t* b,
     }
 }
 
+static D3D11_TEXTURE_ADDRESS_MODE tex_wrap_to_d3d(renderer_wrap_mode w) {
+    switch (w) {
+        case RENDERER_WRAP_REPEAT:           return D3D11_TEXTURE_ADDRESS_WRAP;
+        case RENDERER_WRAP_CLAMP_TO_EDGE:    return D3D11_TEXTURE_ADDRESS_CLAMP;
+        case RENDERER_WRAP_MIRRORED_REPEAT:  return D3D11_TEXTURE_ADDRESS_MIRROR;
+        case RENDERER_WRAP_CLAMP_TO_BORDER:  return D3D11_TEXTURE_ADDRESS_BORDER;
+        default:                             return D3D11_TEXTURE_ADDRESS_WRAP;
+    }
+}
+
 static renderer_texture_t* d3d11_texture_create(
         renderer_t* r, const renderer_texture_desc* desc) {
     d3d11_renderer_data* rd = D3D_RD(r);
@@ -678,6 +689,26 @@ static renderer_texture_t* d3d11_texture_create(
     if (!is_depth && (bind_flags & D3D11_BIND_SHADER_RESOURCE)) {
         hr = ID3D11Device_CreateShaderResourceView(rd->device, (ID3D11Resource*)data->texture, NULL, &data->srv);
         if (FAILED(hr)) goto fail;
+        D3D11_SAMPLER_DESC samp_desc;
+        memset(&samp_desc, 0, sizeof(samp_desc));
+        int is_nearest = (desc->min_filter == RENDERER_FILTER_NEAREST && desc->mag_filter == RENDERER_FILTER_NEAREST);
+        
+        if (desc->max_anisotropy > 1.0f) {
+            samp_desc.Filter = D3D11_FILTER_ANISOTROPIC;
+        } else {
+            samp_desc.Filter = is_nearest ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        }
+        
+        samp_desc.AddressU = tex_wrap_to_d3d(desc->wrap_u);
+        samp_desc.AddressV = tex_wrap_to_d3d(desc->wrap_v);
+        samp_desc.AddressW = tex_wrap_to_d3d(desc->wrap_w);
+        samp_desc.MaxAnisotropy = (UINT)((desc->max_anisotropy > 1.f) ? desc->max_anisotropy : 1);
+        samp_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        samp_desc.MinLOD = 0;
+        samp_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+        hr = ID3D11Device_CreateSamplerState(rd->device, &samp_desc, &data->sampler);
+        if (FAILED(hr)) goto fail;
     }
     if (!is_depth && (bind_flags & D3D11_BIND_RENDER_TARGET)) {
         hr = ID3D11Device_CreateRenderTargetView(rd->device, (ID3D11Resource*)data->texture, NULL, &data->rtv);
@@ -709,6 +740,7 @@ fail:
 static void d3d11_texture_destroy(renderer_t* r, renderer_texture_t* tex) {
     (void)r;
     d3d11_texture_data* data = D3D_TEX(tex);
+    if (data->sampler) ID3D11SamplerState_Release(data->sampler);
     if (data->srv)     ID3D11ShaderResourceView_Release(data->srv);
     if (data->rtv)     ID3D11RenderTargetView_Release(data->rtv);
     if (data->dsv)     ID3D11DepthStencilView_Release(data->dsv);
@@ -803,11 +835,13 @@ static void d3d11_cmd_bind_index_buffer(renderer_cmd_t* cmd, renderer_buffer_t* 
     ID3D11DeviceContext_IASetIndexBuffer(cd->rd->context, D3D_BUF(buf)->buffer, DXGI_FORMAT_R32_UINT, byte_offset);
 }
 
-static void d3d11_cmd_bind_texture(renderer_cmd_t* cmd, renderer_texture_t* tex,
-                                    uint32_t slot) {
-    d3d11_cmd_data*           cd  = D3D_CMD(cmd);
-    ID3D11ShaderResourceView* srv = D3D_TEX(tex)->srv;
+static void d3d11_cmd_bind_texture(renderer_cmd_t* cmd, renderer_texture_t* tex, uint32_t slot) {
+    d3d11_cmd_data* cd  = D3D_CMD(cmd);
+    ID3D11ShaderResourceView* srv = tex ? D3D_TEX(tex)->srv : NULL;
+    ID3D11SamplerState* smp = tex ? D3D_TEX(tex)->sampler : NULL;
+
     ID3D11DeviceContext_PSSetShaderResources(cd->rd->context, slot, 1, &srv);
+    ID3D11DeviceContext_PSSetSamplers(cd->rd->context, slot, 1, &smp);
 }
 
 static void d3d11_cmd_push_constants(renderer_cmd_t* cmd, renderer_pipeline_t* pl,
@@ -861,6 +895,20 @@ static void d3d11_cmd_draw_indexed(renderer_cmd_t* cmd,
             index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
+static void d3d11_cmd_bind_uniform_buffer(renderer_cmd_t* cmd,
+                                           renderer_buffer_t* buf,
+                                           uint32_t slot,
+                                           uint32_t byte_offset,
+                                           uint32_t byte_size) {
+    d3d11_cmd_data* cd  = D3D_CMD(cmd);
+    ID3D11Buffer*   cb  = D3D_BUF(buf)->buffer;
+    UINT            reg = slot + 1u;  /* +1: b0 is push-constant buffer */
+    (void)byte_offset; (void)byte_size;
+    
+    ID3D11DeviceContext_VSSetConstantBuffers(cd->rd->context, reg, 1, &cb);
+    ID3D11DeviceContext_PSSetConstantBuffers(cd->rd->context, reg, 1, &cb);
+}
+
 static const renderer_backend_vtable s_d3d11_vtable = {
     .init        = d3d11_init,
     .shutdown    = d3d11_shutdown,
@@ -891,6 +939,7 @@ static const renderer_backend_vtable s_d3d11_vtable = {
     .cmd_set_scissor         = d3d11_cmd_set_scissor,
     .cmd_draw                = d3d11_cmd_draw,
     .cmd_draw_indexed        = d3d11_cmd_draw_indexed,
+    .cmd_bind_uniform_buffer = d3d11_cmd_bind_uniform_buffer,
 };
 
 const renderer_backend_vtable* renderer_backend_d3d11_vtable(void) {

@@ -16,6 +16,8 @@ typedef enum {
     RENDERER_BACKEND_D3D11,
 } renderer_backend;
 
+char* renderer_backend_to_string(renderer_backend backend);
+
 typedef struct {
     void*            native_window_handle;
     void*            native_display_handle;
@@ -342,6 +344,17 @@ void renderer_cmd_push_constants (renderer_cmd_t*      cmd,
                                   renderer_pipeline_t* pipeline,
                                   const void*          data,
                                   uint32_t             size);
+
+#define RENDERER_MAX_TEXTURE_SLOTS 4          /* = VK_MAX_BOUND_TEXTURES          */
+#define RENDERER_MAX_UBO_SLOTS     8          /* = VK_MAX_BOUND_UBOS              */
+#define RENDERER_UBO_BINDING(slot) (RENDERER_MAX_TEXTURE_SLOTS + (slot))
+
+void renderer_cmd_bind_uniform_buffer(renderer_cmd_t*    cmd,
+                                      renderer_buffer_t* buffer,
+                                      uint32_t           slot,
+                                      uint32_t           byte_offset,
+                                      uint32_t           byte_size);
+
 void renderer_cmd_set_viewport (renderer_cmd_t* cmd,
                                 float x, float y,
                                 float width, float height,

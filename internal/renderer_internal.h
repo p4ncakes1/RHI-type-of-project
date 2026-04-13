@@ -58,6 +58,10 @@ typedef struct renderer_backend_vtable {
                                     uint32_t slot);
     void (*cmd_push_constants)     (renderer_cmd_t*, renderer_pipeline_t*,
                                     const void* data, uint32_t size);
+    void (*cmd_bind_uniform_buffer)(renderer_cmd_t*, renderer_buffer_t*,
+                                    uint32_t slot,
+                                    uint32_t byte_offset,
+                                    uint32_t byte_size);
     void (*cmd_set_viewport)       (renderer_cmd_t*,
                                     float x, float y, float w, float h,
                                     float min_depth, float max_depth);

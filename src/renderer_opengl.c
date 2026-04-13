@@ -559,6 +559,12 @@ static renderer_pipeline_t* opengl_pipeline_create(
         fprintf(stderr, "renderer_opengl: pipeline link error:\n%s\n", log);
         glDeleteProgram(prog); return NULL;
     }
+
+    GLuint block_index = glGetUniformBlockIndex(prog, "UBO");
+    if (block_index != GL_INVALID_INDEX) {
+        glUniformBlockBinding(prog, block_index, 1);
+    }
+
     gl_pipeline_data* data = calloc(1, sizeof(gl_pipeline_data));
     if (!data) { glDeleteProgram(prog); return NULL; }
     data->program       = prog;
@@ -860,6 +866,21 @@ static void opengl_cmd_bind_texture(renderer_cmd_t* cmd, renderer_texture_t* tex
     glBindTexture(td->target, td->id);
 }
 
+static void opengl_cmd_bind_uniform_buffer(renderer_cmd_t* cmd,
+                                           renderer_buffer_t* buf,
+                                           uint32_t slot,
+                                           uint32_t byte_offset,
+                                           uint32_t byte_size) {
+    (void)cmd;
+    gl_buffer_data* bd = GL_BUF(buf);
+    GLuint binding = slot + 1u;  /* +1: slot 0 is push_ubo */
+    if (byte_size)
+        glBindBufferRange(GL_UNIFORM_BUFFER, binding, bd->id,
+                          (GLintptr)byte_offset, (GLsizeiptr)byte_size);
+    else
+        glBindBufferBase(GL_UNIFORM_BUFFER, binding, bd->id);
+}
+
 static void opengl_cmd_push_constants(renderer_cmd_t* cmd, renderer_pipeline_t* pl,
                                       const void* data, uint32_t size) {
     (void)cmd;
@@ -975,6 +996,7 @@ static const renderer_backend_vtable s_opengl_vtable = {
     .cmd_set_scissor         = opengl_cmd_set_scissor,
     .cmd_draw                = opengl_cmd_draw,
     .cmd_draw_indexed        = opengl_cmd_draw_indexed,
+    .cmd_bind_uniform_buffer = opengl_cmd_bind_uniform_buffer,
 };
 
 const renderer_backend_vtable* renderer_backend_opengl_vtable(void) {
