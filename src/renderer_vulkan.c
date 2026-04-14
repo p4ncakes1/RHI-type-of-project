@@ -133,6 +133,8 @@ typedef struct
     VkFormat format;
     int is_depth;
     int owns_image;
+    uint32_t width;
+    uint32_t height;
 } vk_texture_data;
 typedef struct
 {
@@ -140,11 +142,15 @@ typedef struct
     VkImageView view;
     VkFramebuffer framebuffer;
 } vk_swapchain_frame;
+#define VK_MAX_PENDING_FRAMEBUFFERS 16u
 typedef struct
 {
     VkCommandBuffer cmd;
     VkFence fence;
     vk_desc_pool_chain desc_pools;
+    /* Temporary framebuffers created per-pass; destroyed after the fence signals */
+    VkFramebuffer pending_fb[VK_MAX_PENDING_FRAMEBUFFERS];
+    uint32_t      pending_fb_count;
 } vk_frame_sync;
 
 typedef struct
@@ -207,6 +213,11 @@ typedef struct
     uint32_t         bound_ubo_offsets[VK_MAX_BOUND_UBOS];
     uint32_t         bound_ubo_sizes[VK_MAX_BOUND_UBOS];
     int              ubos_dirty;
+    /* Tracked for post-pass layout transitions on offscreen targets */
+    vk_texture_data* offscreen_color_tex;
+    vk_texture_data* offscreen_depth_tex;
+    /* Whether the active render pass targets the swapchain (needs Y-flip) */
+    int              is_swapchain_pass;
 } vk_cmd_data;
 
 #define VK_RD(r) ((vk_renderer_data *)(r)->backend_data)
@@ -778,9 +789,9 @@ static VkPresentModeKHR choose_present_mode(vk_renderer_data *rd, int vsync)
 static VkFormat choose_depth_format(vk_renderer_data *rd)
 {
     static const VkFormat candidates[] = {
-        VK_FORMAT_D24_UNORM_S8_UINT,
-        VK_FORMAT_D32_SFLOAT_S8_UINT,
-        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT, /* preferred – widely supported incl. AMD RDNA */
+        VK_FORMAT_D24_UNORM_S8_UINT,  /* Intel/NVIDIA; not supported on some AMD GPUs */
+        VK_FORMAT_D32_SFLOAT,         /* no stencil fallback                          */
     };
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i)
     {
@@ -1197,23 +1208,56 @@ static int vulkan_init(renderer_t *r, const renderer_create_desc *desc)
     rd->swapchain_format = choose_surface_format(rd);
     rd->depth_format = choose_depth_format(rd);
 
+    /* Allow caller to override the chosen formats (e.g. for HDR or explicit depth) */
+    if (desc->color_format != 0) {
+        VkFormat requested = tex_fmt_to_vk(desc->color_format);
+        /* Verify the surface supports the requested format before accepting it */
+        uint32_t sfmt_count = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(rd->physical_device, rd->surface, &sfmt_count, NULL);
+        VkSurfaceFormatKHR *sfmts = calloc(sfmt_count, sizeof(VkSurfaceFormatKHR));
+        if (sfmts) {
+            vkGetPhysicalDeviceSurfaceFormatsKHR(rd->physical_device, rd->surface, &sfmt_count, sfmts);
+            for (uint32_t i = 0; i < sfmt_count; ++i) {
+                if (sfmts[i].format == requested) { rd->swapchain_format = requested; break; }
+            }
+            free(sfmts);
+        }
+    }
+    if (desc->depth_format != 0) {
+        VkFormat requested = tex_fmt_to_vk(desc->depth_format);
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(rd->physical_device, requested, &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+            rd->depth_format = requested;
+        else
+            fprintf(stderr, "renderer_vulkan: requested depth format %u not supported, using default\n", (unsigned)requested);
+    }
+
     if (create_swapchain(rd, desc->width, desc->height) != 0)
         goto fail;
     if (create_frame_objects(rd) != 0)
         goto fail;
 
-    /* ---- Descriptor set layout: textures (set=0, b0..3) + UBOs (b4..11) ---- */
-    VkDescriptorSetLayoutBinding bindings[VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS];
+    /* ---- Descriptor set layout ----
+     * The SPIR-V shaders declare:
+     *   binding = 0   -> combined image sampler (tex0)
+     *   binding = 1+  -> uniform buffer  (UBO slot 0 = binding 1, slot 1 = binding 2, ...)
+     * UBOs therefore start at binding 1, i.e. right after the single texture binding.
+     * VK_MAX_BOUND_TEXTURES is still the *pool* limit; the layout only exposes 1
+     * sampler slot (binding 0) to match the compiled SPIR-V. */
+#define VK_DESC_TEX_BINDINGS 1u
+#define VK_DESC_UBO_BASE     VK_DESC_TEX_BINDINGS
+    VkDescriptorSetLayoutBinding bindings[VK_DESC_TEX_BINDINGS + VK_MAX_BOUND_UBOS];
     memset(bindings, 0, sizeof(bindings));
-    for (int i = 0; i < VK_MAX_BOUND_TEXTURES; i++) {
-        bindings[i].binding         = (uint32_t)i;
+    for (uint32_t i = 0; i < VK_DESC_TEX_BINDINGS; i++) {
+        bindings[i].binding         = i;
         bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
     for (int i = 0; i < VK_MAX_BOUND_UBOS; i++) {
-        int b = VK_MAX_BOUND_TEXTURES + i;
-        bindings[b].binding         = (uint32_t)b;
+        uint32_t b = VK_DESC_UBO_BASE + (uint32_t)i;
+        bindings[b].binding         = b;
         bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[b].descriptorCount = 1;
         bindings[b].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT |
@@ -1221,7 +1265,7 @@ static int vulkan_init(renderer_t *r, const renderer_create_desc *desc)
     }
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS,
+        .bindingCount = VK_DESC_TEX_BINDINGS + VK_MAX_BOUND_UBOS,
         .pBindings    = bindings,
     };
     if (vkCreateDescriptorSetLayout(rd->device, &layout_info, NULL,
@@ -1287,6 +1331,9 @@ static void vulkan_shutdown(renderer_t *r)
         if (rd->frames[i].fence)
             vkDestroyFence(rd->device, rd->frames[i].fence, NULL);
         vk_desc_pool_chain_destroy(&rd->frames[i].desc_pools, rd->device);
+        for (uint32_t j = 0; j < rd->frames[i].pending_fb_count; ++j)
+            vkDestroyFramebuffer(rd->device, rd->frames[i].pending_fb[j], NULL);
+        rd->frames[i].pending_fb_count = 0;
     }
     for (uint32_t i = 0; i < rd->swapchain_image_count && i < VK_MAX_SWAPCHAIN_IMAGES; ++i)
         if (rd->image_avail[i])
@@ -1358,6 +1405,11 @@ static void vulkan_begin_frame(renderer_t *r)
     vkResetFences(rd->device, 1, &f->fence);
     vk_desc_pool_chain_reset(&f->desc_pools, rd->device);
 
+    /* Destroy temporary offscreen framebuffers from the previous use of this slot */
+    for (uint32_t i = 0; i < f->pending_fb_count; ++i)
+        vkDestroyFramebuffer(rd->device, f->pending_fb[i], NULL);
+    f->pending_fb_count = 0;
+
     VkResult res = vkAcquireNextImageKHR(rd->device, rd->swapchain, UINT64_MAX,
                                          rd->pending_acquire_sem, VK_NULL_HANDLE,
                                          &rd->swapchain_index);
@@ -1403,6 +1455,9 @@ static void vulkan_resize(renderer_t *r, int w, int h)
 {
     vk_renderer_data *rd = VK_RD(r);
     vkDeviceWaitIdle(rd->device);
+    
+    rd->swapchain_extent.width = (uint32_t)w;
+    rd->swapchain_extent.height = (uint32_t)h;
     create_swapchain(rd, w, h);
 }
 
@@ -1418,6 +1473,13 @@ static renderer_render_pass_t *vulkan_render_pass_create(
 
     VkFormat color_fmt = tex_fmt_to_vk(desc->color_format);
     VkFormat depth_fmt = tex_fmt_to_vk(desc->depth_format);
+    /* Substitute unsupported depth formats with the GPU-validated fallback */
+    if (desc->has_depth) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(rd->physical_device, depth_fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT))
+            depth_fmt = rd->depth_format;
+    }
     VkSampleCountFlagBits samples = (desc->sample_count > 1)
                                         ? (VkSampleCountFlagBits)desc->sample_count
                                         : VK_SAMPLE_COUNT_1_BIT;
@@ -1935,6 +1997,16 @@ static renderer_texture_t *vulkan_texture_create(
     vk_renderer_data *rd = VK_RD(r);
     VkFormat fmt = tex_fmt_to_vk(desc->format);
     int is_depth = fmt_is_depth(fmt);
+    /* If the requested depth format is not supported by this GPU, fall back to
+     * the renderer-chosen depth format (already validated during init). */
+    if (is_depth) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(rd->physical_device, fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            fmt = rd->depth_format; /* use the GPU-validated fallback                   */
+            /* Re-evaluate stencil availability after substitution */
+        }
+    }
     int array_layers = (desc->array_layers > 1) ? desc->array_layers : 1;
     int sample_count = (desc->sample_count > 1) ? desc->sample_count : 1;
     uint32_t mip_levels = (desc->mip_levels > 0) ? (uint32_t)desc->mip_levels : 1;
@@ -1988,6 +2060,8 @@ static renderer_texture_t *vulkan_texture_create(
     data->format = fmt;
     data->is_depth = is_depth;
     data->owns_image = 1;
+    data->width  = (uint32_t)desc->width;
+    data->height = (uint32_t)desc->height;
 
     if (vkCreateImage(rd->device, &ici, NULL, &data->image) != VK_SUCCESS)
     {
@@ -2251,20 +2325,50 @@ static void vulkan_cmd_begin_render_pass(renderer_cmd_t *cmd,
     }
     else
     {
+        /* Determine framebuffer dimensions from the bound textures, not the swapchain */
+        int w = (int)rd->swapchain_extent.width;
+        int h = (int)rd->swapchain_extent.height;
+        if (color_tex) {
+            w = (int)VK_TEX(color_tex)->width;
+            h = (int)VK_TEX(color_tex)->height;
+        } else if (depth_tex) {
+            w = (int)VK_TEX(depth_tex)->width;
+            h = (int)VK_TEX(depth_tex)->height;
+        }
+
         VkImageView att[2];
         uint32_t att_count = 0;
-        if (color_tex)
+        if (color_tex) {
+            /* Transition color texture to color attachment optimal */
+            image_barrier(cd->vk_cmd, VK_TEX(color_tex)->image,
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
             att[att_count++] = VK_TEX(color_tex)->view;
-        if (depth_tex)
+        }
+        if (depth_tex) {
+            VkImageAspectFlags depth_asp = VK_IMAGE_ASPECT_DEPTH_BIT;
+            if (fmt_has_stencil(VK_TEX(depth_tex)->format))
+                depth_asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            image_barrier(cd->vk_cmd, VK_TEX(depth_tex)->image,
+                depth_asp,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
             att[att_count++] = VK_TEX(depth_tex)->view;
-        int w = rd->swapchain_extent.width, h = rd->swapchain_extent.height;
+        }
 
         VkFramebufferCreateInfo fci = {
             .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
             .renderPass = rpd->vk_render_pass,
             .attachmentCount = att_count,
             .pAttachments = att,
-            .width = (uint32_t)w,
+            .width  = (uint32_t)w,
             .height = (uint32_t)h,
             .layers = 1,
         };
@@ -2281,26 +2385,75 @@ static void vulkan_cmd_begin_render_pass(renderer_cmd_t *cmd,
             clears[clear_count++].color = (VkClearColorValue){{0.f, 0.f, 0.f, 1.f}};
     }
 
+    VkExtent2D render_extent = rpd->is_swapchain
+        ? rd->swapchain_extent
+        : (VkExtent2D){ (uint32_t)(color_tex ? (int)VK_TEX(color_tex)->width  : (depth_tex ? (int)VK_TEX(depth_tex)->width  : (int)rd->swapchain_extent.width)),
+                        (uint32_t)(color_tex ? (int)VK_TEX(color_tex)->height : (depth_tex ? (int)VK_TEX(depth_tex)->height : (int)rd->swapchain_extent.height)) };
+
     VkRenderPassBeginInfo rbi = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = rpd->vk_render_pass,
         .framebuffer = fb,
-        .renderArea = {{0, 0}, rd->swapchain_extent},
+        .renderArea = {{0, 0}, render_extent},
         .clearValueCount = clear_count,
         .pClearValues = clear ? clears : NULL,
     };
     vkCmdBeginRenderPass(cd->vk_cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     cd->active_render_pass = rpd->vk_render_pass;
+    /* Remember offscreen targets so end_render_pass can transition them for sampling */
+    cd->is_swapchain_pass = rpd->is_swapchain;
+    if (!rpd->is_swapchain) {
+        cd->offscreen_color_tex = color_tex ? VK_TEX(color_tex) : NULL;
+        cd->offscreen_depth_tex = depth_tex ? VK_TEX(depth_tex) : NULL;
+    } else {
+        cd->offscreen_color_tex = NULL;
+        cd->offscreen_depth_tex = NULL;
+    }
 }
 
 static void vulkan_cmd_end_render_pass(renderer_cmd_t *cmd)
 {
     vk_cmd_data *cd = VK_CMD(cmd);
     vkCmdEndRenderPass(cd->vk_cmd);
-    /* Destroy the temporary offscreen framebuffer if we created one */
+
+    /* Transition offscreen color texture to SHADER_READ_ONLY so it can be
+     * sampled in subsequent passes (e.g., post-process / blit to swapchain) */
+    if (cd->offscreen_color_tex) {
+        image_barrier(cd->vk_cmd, cd->offscreen_color_tex->image,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        cd->offscreen_color_tex = NULL;
+    }
+    if (cd->offscreen_depth_tex) {
+        VkImageAspectFlags asp = VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (fmt_has_stencil(cd->offscreen_depth_tex->format))
+            asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        image_barrier(cd->vk_cmd, cd->offscreen_depth_tex->image,
+            asp,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        cd->offscreen_depth_tex = NULL;
+    }
+
+    /* Defer destruction of the temporary offscreen framebuffer until after the
+     * GPU fence signals (next time this frame-in-flight slot is reused).
+     * Destroying during recording or before queue execution completes is invalid. */
     if (cd->active_framebuffer)
     {
-        vkDestroyFramebuffer(cd->rd->device, cd->active_framebuffer, NULL);
+        vk_frame_sync* fs = &cd->rd->frames[cd->rd->current_frame];
+        if (fs->pending_fb_count < VK_MAX_PENDING_FRAMEBUFFERS)
+            fs->pending_fb[fs->pending_fb_count++] = cd->active_framebuffer;
+        else
+            vkDestroyFramebuffer(cd->rd->device, cd->active_framebuffer, NULL); /* fallback */
         cd->active_framebuffer = VK_NULL_HANDLE;
     }
 }
@@ -2374,9 +2527,15 @@ static void vulkan_cmd_set_viewport(renderer_cmd_t *cmd,
                                     float min_depth, float max_depth)
 {
     vk_cmd_data *cd = VK_CMD(cmd);
-    /* Vulkan NDC has Y pointing down; flip Y and height to match OpenGL/HLSL
-     * convention when the caller uses the same coordinate system. */
-    VkViewport vp = {x, y + h, w, -h, min_depth, max_depth};
+    /* Apply the Y-flip (Vulkan NDC Y-down vs OpenGL Y-up) only when rendering
+     * directly to the swapchain.  Offscreen passes write into a texture that
+     * the blit shader will sample without any additional flip, so their
+     * coordinates should be left as-is. */
+    VkViewport vp;
+    if (cd->is_swapchain_pass)
+        vp = (VkViewport){x, y + h, w, -h, min_depth, max_depth};
+    else
+        vp = (VkViewport){x, y, w, h, min_depth, max_depth};
     vkCmdSetViewport(cd->vk_cmd, 0, 1, &vp);
 }
 
@@ -2416,13 +2575,15 @@ static void vulkan_flush_descriptors(vk_cmd_data* cd) {
     VkDescriptorSet set = vk_desc_chain_alloc(ch, rd->device, rd->desc_layout);
     if (set == VK_NULL_HANDLE) return;
 
-    VkDescriptorImageInfo  img[VK_MAX_BOUND_TEXTURES];
+    /* Layout: binding 0 = sampler, bindings 1..VK_MAX_BOUND_UBOS = UBOs.
+     * Must match the descriptor set layout built in vulkan_init. */
+    VkDescriptorImageInfo  img[VK_DESC_TEX_BINDINGS];
     VkDescriptorBufferInfo buf[VK_MAX_BOUND_UBOS];
-    VkWriteDescriptorSet   writes[VK_MAX_BOUND_TEXTURES + VK_MAX_BOUND_UBOS];
+    VkWriteDescriptorSet   writes[VK_DESC_TEX_BINDINGS + VK_MAX_BOUND_UBOS];
     uint32_t               wc = 0;
 
-    /* Texture bindings — binding 0..VK_MAX_BOUND_TEXTURES-1 */
-    for (int i = 0; i < VK_MAX_BOUND_TEXTURES; i++) {
+    /* Texture bindings — binding 0 only */
+    for (uint32_t i = 0; i < VK_DESC_TEX_BINDINGS; i++) {
         vk_texture_data* td = cd->bound_textures[i]
                             ? cd->bound_textures[i]
                             : VK_TEX(rd->dummy_tex);
@@ -2434,14 +2595,14 @@ static void vulkan_flush_descriptors(vk_cmd_data* cd) {
         writes[wc++] = (VkWriteDescriptorSet){
             .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet          = set,
-            .dstBinding      = (uint32_t)i,
+            .dstBinding      = i,
             .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1,
             .pImageInfo      = &img[i],
         };
     }
 
-    /* UBO bindings — binding VK_MAX_BOUND_TEXTURES..+VK_MAX_BOUND_UBOS-1 */
+    /* UBO bindings — bindings VK_DESC_UBO_BASE..VK_DESC_UBO_BASE+VK_MAX_BOUND_UBOS-1 */
     for (int i = 0; i < VK_MAX_BOUND_UBOS; i++) {
         vk_buffer_data* bd = cd->bound_ubos[i];
         buf[i] = (VkDescriptorBufferInfo){
@@ -2452,7 +2613,7 @@ static void vulkan_flush_descriptors(vk_cmd_data* cd) {
         writes[wc++] = (VkWriteDescriptorSet){
             .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet          = set,
-            .dstBinding      = (uint32_t)(VK_MAX_BOUND_TEXTURES + i),
+            .dstBinding      = VK_DESC_UBO_BASE + (uint32_t)i,
             .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
             .pBufferInfo     = &buf[i],

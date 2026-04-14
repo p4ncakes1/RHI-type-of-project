@@ -13,31 +13,7 @@ typedef struct renderer_cmd_t         renderer_cmd_t;
 typedef enum {
     RENDERER_BACKEND_OPENGL,
     RENDERER_BACKEND_VULKAN,
-    RENDERER_BACKEND_D3D11,
 } renderer_backend;
-
-char* renderer_backend_to_string(renderer_backend backend);
-
-typedef struct {
-    void*            native_window_handle;
-    void*            native_display_handle;
-    int              width;
-    int              height;
-    int              vsync;
-    int              sample_count;   /* MSAA; 1 = disabled, 2/4/8 = multisampled   */
-    renderer_backend backend;
-} renderer_create_desc;
-
-renderer_t* renderer_create  (const renderer_create_desc* desc);
-void        renderer_destroy (renderer_t* renderer);
-
-void renderer_begin_frame (renderer_t* renderer);
-void renderer_end_frame   (renderer_t* renderer);
-void renderer_present     (renderer_t* renderer);
-void renderer_resize      (renderer_t* renderer, int width, int height);
-
-renderer_backend renderer_get_backend (renderer_t* renderer);
-void             renderer_get_size    (renderer_t* renderer, int* width, int* height);
 
 typedef enum {
     RENDERER_TEXTURE_FORMAT_RGBA8,
@@ -62,6 +38,36 @@ typedef enum {
     RENDERER_TEXTURE_FORMAT_DEPTH24_STENCIL8,
     RENDERER_TEXTURE_FORMAT_DEPTH32F_STENCIL8,
 } renderer_texture_format;
+
+char* renderer_backend_to_string(renderer_backend backend);
+
+typedef struct {
+    void*            native_window_handle;
+    void*            native_display_handle;
+    int              width;
+    int              height;
+    int              vsync;
+    int              sample_count;       /* MSAA; 1 = disabled, 2/4/8 = multisampled  */
+    renderer_backend backend;
+    /* Optional: override the swapchain/default-framebuffer surface formats.
+     * Pass 0 (RENDERER_TEXTURE_FORMAT_RGBA8 / RENDERER_TEXTURE_FORMAT_DEPTH24_STENCIL8)
+     * to accept the backend-chosen default.                                            */
+    renderer_texture_format color_format; /* swapchain color format (0 = backend default) */
+    renderer_texture_format depth_format; /* swapchain depth format (0 = backend default) */
+} renderer_create_desc;
+
+renderer_t* renderer_create  (const renderer_create_desc* desc);
+void        renderer_destroy (renderer_t* renderer);
+
+void renderer_begin_frame (renderer_t* renderer);
+void renderer_end_frame   (renderer_t* renderer);
+void renderer_present     (renderer_t* renderer);
+void renderer_resize      (renderer_t* renderer, int width, int height);
+
+renderer_backend renderer_get_backend (renderer_t* renderer);
+void             renderer_get_size    (renderer_t* renderer, int* width, int* height);
+
+
 
 typedef enum {
     RENDERER_LOAD_OP_LOAD,           /* keep existing contents            */

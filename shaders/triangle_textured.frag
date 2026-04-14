@@ -11,7 +11,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D tex0;
 
 // Uniform buffer for color modulation (slot 0 → binding = 4)
-layout(set = 0, binding = 4, std140) uniform UBO {
+layout(set = 0, binding = 1, std140) uniform UBO {
     vec4 colorMod;
 };
 

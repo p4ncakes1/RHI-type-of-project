@@ -5,7 +5,6 @@
 static const renderer_backend_vtable* select_vtable(renderer_backend backend) {
     switch (backend) {
         case RENDERER_BACKEND_OPENGL: return renderer_backend_opengl_vtable();
-        case RENDERER_BACKEND_D3D11:  return renderer_backend_d3d11_vtable();
         case RENDERER_BACKEND_VULKAN: return renderer_backend_vulkan_vtable();
         default:
             fatal_error("renderer_create: unknown backend %d.", (int)backend);
@@ -15,9 +14,8 @@ static const renderer_backend_vtable* select_vtable(renderer_backend backend) {
 
 char* renderer_backend_to_string(renderer_backend backend) {
     switch (backend) {
-        case RENDERER_BACKEND_OPENGL: return "OpenGL"; break;
-        case RENDERER_BACKEND_VULKAN: return "Vulkan"; break;
-        case RENDERER_BACKEND_D3D11:  return "D3D11";  break;
+        case RENDERER_BACKEND_OPENGL: return "OpenGL";
+        case RENDERER_BACKEND_VULKAN: return "Vulkan";
     }
     return "NO BACKEND";
 }

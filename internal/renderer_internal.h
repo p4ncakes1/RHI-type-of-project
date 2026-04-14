@@ -79,7 +79,6 @@ typedef struct renderer_backend_vtable {
 } renderer_backend_vtable;
 
 const renderer_backend_vtable* renderer_backend_opengl_vtable(void);
-const renderer_backend_vtable* renderer_backend_d3d11_vtable(void);
 const renderer_backend_vtable* renderer_backend_vulkan_vtable(void);
 
 #endif
